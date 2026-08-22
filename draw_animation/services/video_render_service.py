@@ -7,7 +7,8 @@ import cv2
 import numpy as np
 
 from draw_animation.config import RenderConfig
-from draw_animation.services.stroke_path_service import GridStrokePathService, StrokePlan
+from draw_animation.services.hand_overlay_service import HandOverlay, HandOverlayService
+from draw_animation.services.stroke_path_service import StrokePathService, StrokePlan
 
 ProgressCallback = Callable[[float, str], None]
 CancelCheck = Callable[[], bool]
@@ -20,8 +21,13 @@ class RenderCancelled(RuntimeError):
 class VideoRenderService:
     """Render one still image as a progressive whiteboard drawing MP4."""
 
-    def __init__(self, path_service: GridStrokePathService | None = None) -> None:
-        self._path_service = path_service or GridStrokePathService()
+    def __init__(
+        self,
+        path_service: StrokePathService | None = None,
+        hand_overlay_service: HandOverlayService | None = None,
+    ) -> None:
+        self._path_service = path_service or StrokePathService()
+        self._hand_overlay_service = hand_overlay_service or HandOverlayService()
 
     def render(
         self,
@@ -41,8 +47,28 @@ class VideoRenderService:
         paper_bgr = self._hex_to_bgr(config.paper_color)
         source = self._match_background(source, paper_bgr, config) if config.match_background else source
         ink_mask, ink_image = self._extract_ink(source)
-        plan = self._path_service.build(ink_mask, config.grid_size)
-        self._emit(progress, 0.04, f"Detected {plan.active_cells} ink cells")
+        plan = self._path_service.build(
+            ink_mask=ink_mask,
+            mode=config.ink_path_mode,
+            grid_size=config.grid_size,
+            skeleton_min_points=config.skeleton_min_points,
+            skeleton_spacing=config.skeleton_spacing,
+        )
+        self._emit(
+            progress,
+            0.04,
+            f"Stroke mode: {plan.mode}; {len(plan.strokes)} stroke(s), {len(plan.flattened)} point(s)",
+        )
+
+        hand_overlay: HandOverlay | None = None
+        if config.show_hand and config.hand_image_path:
+            hand_overlay = self._hand_overlay_service.load(
+                Path(config.hand_image_path),
+                target_height=config.hand_height,
+                tip_anchor_x=config.hand_tip_anchor_x,
+                tip_anchor_y=config.hand_tip_anchor_y,
+            )
+            self._emit(progress, 0.045, f"Loaded hand PNG: {Path(config.hand_image_path).name}")
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         writer = self._open_writer(output_path, config.fps, source.shape[1], source.shape[0])
@@ -55,6 +81,7 @@ class VideoRenderService:
                 plan=plan,
                 paper_bgr=paper_bgr,
                 config=config,
+                hand_overlay=hand_overlay,
                 progress=progress,
                 cancel_check=cancel_check,
             )
@@ -77,6 +104,7 @@ class VideoRenderService:
         plan: StrokePlan,
         paper_bgr: np.ndarray,
         config: RenderConfig,
+        hand_overlay: HandOverlay | None,
         progress: ProgressCallback | None,
         cancel_check: CancelCheck | None,
     ) -> None:
@@ -104,29 +132,42 @@ class VideoRenderService:
             self._check_cancel(cancel_check)
             target_index = self._mapped_index(frame_index, ink_frames, len(flat_path))
             for path_index in range(last_path_index + 1, target_index + 1):
-                self._reveal_ink_cell(
-                    canvas,
-                    ink_image,
-                    ink_mask,
-                    flat_path[path_index],
-                    config.grid_size,
-                    revealed_cells,
-                )
+                if plan.mode == "skeleton":
+                    current = flat_path[path_index]
+                    if path_index == 0 or path_index in plan.pen_lift_indices:
+                        previous = current
+                    else:
+                        previous = flat_path[path_index - 1]
+                    self._reveal_ink_segment(
+                        canvas,
+                        ink_image,
+                        ink_mask,
+                        previous,
+                        current,
+                        config.ink_reveal_radius,
+                    )
+                else:
+                    self._reveal_ink_cell(
+                        canvas,
+                        ink_image,
+                        ink_mask,
+                        flat_path[path_index],
+                        config.grid_size,
+                        revealed_cells,
+                    )
             last_path_index = max(last_path_index, target_index)
             tip = flat_path[target_index]
             frame = canvas.copy()
-            if config.show_hand:
-                self._draw_hand_and_pen(frame, tip)
+            self._stamp_hand(frame, tip, config, hand_overlay)
             writer.write(frame)
-            self._emit(progress, 0.04 + 0.61 * ((frame_index + 1) / ink_frames), "Drawing ink")
+            self._emit(progress, 0.05 + 0.60 * ((frame_index + 1) / ink_frames), "Drawing ink")
 
         for frame_index in range(color_frames):
             self._check_cancel(cancel_check)
             p = (frame_index + 1) / color_frames
             frame = self._contour_wipe(canvas, source, p)
             tip = self._wipe_tip(w, h, p, frame_index)
-            if config.show_hand:
-                self._draw_hand_and_pen(frame, tip)
+            self._stamp_hand(frame, tip, config, hand_overlay)
             writer.write(frame)
             self._emit(progress, 0.65 + 0.28 * p, "Revealing color")
 
@@ -241,6 +282,27 @@ class VideoRenderService:
         target[mask] = source[mask]
 
     @staticmethod
+    def _reveal_ink_segment(
+        canvas: np.ndarray,
+        ink_image: np.ndarray,
+        ink_mask: np.ndarray,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        radius: int,
+    ) -> None:
+        segment = np.zeros(ink_mask.shape, dtype=np.uint8)
+        cv2.line(
+            segment,
+            start,
+            end,
+            255,
+            thickness=max(1, radius * 2 + 1),
+            lineType=cv2.LINE_AA,
+        )
+        reveal = (segment > 0) & ink_mask
+        canvas[reveal] = ink_image[reveal]
+
+    @staticmethod
     def _contour_wipe(base: np.ndarray, source: np.ndarray, progress: float) -> np.ndarray:
         h, w = source.shape[:2]
         progress = float(np.clip(progress, 0.0, 1.0))
@@ -260,6 +322,20 @@ class VideoRenderService:
         x = int(np.clip(lane * width, 0, width - 1))
         y = int(np.clip(progress * height, 0, height - 1))
         return x, y
+
+    @staticmethod
+    def _stamp_hand(
+        frame: np.ndarray,
+        tip: tuple[int, int],
+        config: RenderConfig,
+        hand_overlay: HandOverlay | None,
+    ) -> None:
+        if not config.show_hand:
+            return
+        if hand_overlay is not None:
+            hand_overlay.stamp(frame, tip)
+            return
+        VideoRenderService._draw_hand_and_pen(frame, tip)
 
     @staticmethod
     def _draw_hand_and_pen(frame: np.ndarray, tip: tuple[int, int]) -> None:
